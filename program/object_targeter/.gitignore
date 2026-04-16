@@ -1,0 +1,9 @@
+vosk-model*
+*.pt
+*.wav
+logs
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
