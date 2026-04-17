@@ -1,4 +1,5 @@
 import threading
+import os
 from vosk import SetLogLevel
 from config import WorkConfigManager
 from serialwriter import SerialWriter
@@ -6,7 +7,7 @@ from zoom import ZoomController
 from preprocessor import Preprocessor
 from audio import AudioRecorder
 from analyze import VideoAnalyzer
-from ioops import IOOperator
+from ioops_headless import IOOperatorHeadless
 from logger import Logger
 from smooth import SmoothingFilter
 from commands import CommandParser
@@ -15,6 +16,10 @@ from angle import AngleCalculator
 import logging
 
 class Platform:
+    @staticmethod
+    def _default_video_device() -> str | int:
+        return "/dev/video0" if os.name == "posix" else 0
+
     def __init__(self, size: tuple[int, int], fov:tuple[int, int], init_conf: float = 0.1):
         SetLogLevel(-1)
         self.__size = size
@@ -28,7 +33,7 @@ class Platform:
         self.__parser = CommandParser()
         self.__recorder = AudioRecorder(config_manager=self.__config_manager, zoom=self.__zoom, parser=self.__parser, logger=self.__logger)
         
-        self.__io = IOOperator("/dev/video2", 30, self.__size, self.__zoom, self.__config_manager, logger=self.__logger)
+        self.__io = IOOperatorHeadless(self._default_video_device(), 30, self.__size, self.__zoom, logger=self.__logger)
         self.__smoother = SmoothingFilter(window=2)
 
         self.__analyzer = VideoAnalyzer(io = self.__io, config_manager=self.__config_manager, 
@@ -63,4 +68,4 @@ class Platform:
                 self.__logger.info("Завершено.")
 
 if __name__ == '__main__':
-    Platform((1920, 1080), (58, 33)).run()
+    Platform((1720, 980), (58, 33)).run()

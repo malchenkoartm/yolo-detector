@@ -3,7 +3,7 @@ from interfaces import IWorkConfigManager, WorkConfig, ILogger
 import threading
 from ultralytics.utils.plotting import Colors
 import argostranslate.translate as translate
-from model_names import en_model_names
+from model_names import en_model_names, ru_model_names
 import time
 
 class WorkConfigManager(IWorkConfigManager):
@@ -19,13 +19,27 @@ class WorkConfigManager(IWorkConfigManager):
         self.__target_track = None
 
         self.__updated: bool = True
+        self.__en_names_set = {str(v).strip().lower() for v in en_model_names.values()}
+        self.__ru_to_en = {str(ru).strip().lower(): str(en_model_names[idx]).strip().lower()
+                           for idx, ru in ru_model_names.items() if idx in en_model_names}
+
+    def __normalize_to_en(self, text: str) -> str:
+        t = str(text or "").strip().lower()
+        if not t:
+            return t
+        if t in self.__en_names_set:
+            return t
+        if t in self.__ru_to_en:
+            return self.__ru_to_en[t]
+        # Fallback: ru->en MT
+        translates = self.__translater.hypotheses(t)
+        guess = str(translates[0].value).strip().lower() if translates else t
+        return guess if guess else t
 
     def place(self, ru_text):
         if ru_text is not None:
             start_time = time.time()
-            translates = self.__translater.hypotheses(ru_text)
-            common = [x.value for x in translates if x.value in en_model_names]
-            en_text = common[0] if common else translates[0].value
+            en_text = self.__normalize_to_en(ru_text)
             if self.__logger:
                 self.__logger.info(f"translated: {en_text}, time = {(time.time() - start_time):.2f}")
             with self.__lock:
@@ -35,9 +49,7 @@ class WorkConfigManager(IWorkConfigManager):
     def add(self, ru_text):
         if ru_text is not None:
             start_time = time.time()
-            translates = self.__translater.hypotheses(ru_text)
-            common = [x.value for x in translates if x.value in en_model_names]
-            en_text = common[0] if common else translates[0].value
+            en_text = self.__normalize_to_en(ru_text)
             if self.__logger:
                 self.__logger.info(f"translated: {en_text}, time = {(time.time() - start_time):.2f}")
             with self.__lock:

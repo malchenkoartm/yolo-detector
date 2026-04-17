@@ -184,6 +184,7 @@ class GUIEventType(Enum):
     VIDEO_SOURCE_CHANGED = auto()
     AUDIO_SOURCE_CHANGED = auto()
     AUDIO_SETTINGS_CHANGED = auto()
+    CLASS_NAMES_CHANGED = auto()
     TOGGLE_WORK = auto()
     CONF_CHANGED = auto()
     TARGET_TRACK_CHANGED = auto()

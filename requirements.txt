@@ -1,0 +1,9 @@
+numpy
+opencv-python
+pyqt6
+sounddevice
+vosk
+ultralytics
+argostranslate
+pyserial
+ru-word2number

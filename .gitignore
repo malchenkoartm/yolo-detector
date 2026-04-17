@@ -1,5 +1,15 @@
 *.mp4
 *.wav
+.cursorignore
 *.pt
 logs
 test
+program/object_targeter/__pycache__/
+program/object_targeter/*.pyc
+program/object_targeter/*.pyo
+program/object_targeter/*.pyd
+program/object_targeter/.Python
+program/object_targeter/logs
+program/object_targeter/vosk-model-small-ru-0.22
+program/object_targeter/yolov8m-worldv2.pt
+program/object_targeter/yolov8m-worldv2.pt

@@ -1,6 +1,8 @@
 import threading
 import time
 import logging
+import os
+import re
 
 import cv2
 import numpy as np
@@ -76,8 +78,12 @@ class OverlayLite:
 
 
 class PlatformQt:
+    @staticmethod
+    def _default_video_device() -> str | int:
+        return "/dev/video0" if os.name == "posix" else 0
+
     def __init__(self, size: tuple[int, int], fov: tuple[int, int], init_conf: float = 0.1,
-                 videodev: str = "/dev/video2", fps: int = 30):
+                 videodev: str | int | None = None, fps: int = 30):
         SetLogLevel(-1)
         self.__size = size
         self.__init_conf = init_conf
@@ -90,7 +96,13 @@ class PlatformQt:
         self.__preprocessor = Preprocessor(use_clahe=False, use_bilateral=False)
         self.__parser = CommandParser()
 
-        self.__io = IOOperatorHeadless(videodev, fps, self.__size, self.__zoom, logger=self.__logger)
+        self.__io = IOOperatorHeadless(
+            videodev if videodev is not None else self._default_video_device(),
+            fps,
+            self.__size,
+            self.__zoom,
+            logger=self.__logger,
+        )
         self.__smoother = SmoothingFilter(window=2)
         self.__analyzer = VideoAnalyzer(
             io=self.__io,
@@ -116,9 +128,26 @@ class PlatformQt:
 
         self.__overlay = OverlayLite()
         self.__gui = PyQt6IOOperatorGUI()
+        self.__gui.set_class_apply_callback(self.__apply_classes)
 
         self.__thread_classes = [self.__io, self.__analyzer, self.__recorder, self.__writer]
         self.__threads = [threading.Thread(target=c.start) for c in self.__thread_classes]
+
+    def __apply_classes(self, mode: str, text: str):
+        raw = [x.strip() for x in re.split(r"[,;/\n]+", str(text or ""))]
+        classes = [x for x in raw if x]
+        if not classes:
+            self.__gui.set_status("classes: empty input")
+            return
+        if mode == "add":
+            for c in classes:
+                self.__config_manager.add(c)
+        else:
+            self.__config_manager.place(classes[0])
+            for c in classes[1:]:
+                self.__config_manager.add(c)
+        self.__logger.info(f"[GUI] classes {mode}: {classes}")
+        self.__gui.set_status(f"classes {mode}: {', '.join(classes[:3])}")
 
     def __restart_audio(self, device):
         try:
@@ -177,8 +206,11 @@ class PlatformQt:
                 elif ev.type == GUIEventType.TARGET_TRACK_CHANGED:
                     self.__config_manager.target_track = ev.value if isinstance(ev.value, int) else None
                 elif ev.type == GUIEventType.VIDEO_SOURCE_CHANGED and isinstance(ev.value, str):
-                    # In the linux+ffmpeg pipeline we expect /dev/videoX here.
-                    self.__io.set_videodev(ev.value)
+                    source = ev.value.strip()
+                    if source.isdigit():
+                        self.__io.set_videodev(int(source))
+                    else:
+                        self.__io.set_videodev(source)
                 elif ev.type == GUIEventType.AUDIO_SOURCE_CHANGED:
                     if isinstance(ev.value, str) and ev.value.isdigit():
                         self.__restart_audio(int(ev.value))
@@ -201,6 +233,18 @@ class PlatformQt:
                             self.__recorder.set_fs(int(ev.value["fs"]))
                     except Exception as e:
                         self.__logger.warning(f"[Audio] settings apply failed: {e}")
+                elif ev.type == GUIEventType.CLASS_NAMES_CHANGED:
+                    try:
+                        self.__logger.info(f"[GUI] CLASS_NAMES_CHANGED raw={ev.value}")
+                        if isinstance(ev.value, dict):
+                            mode = str(ev.value.get("mode", "place")).strip().lower()
+                            text = str(ev.value.get("text", "")).strip()
+                        else:
+                            mode = "place"
+                            text = str(ev.value).strip() if ev.value is not None else ""
+                        self.__apply_classes(mode, text)
+                    except Exception as e:
+                        self.__logger.warning(f"[GUI] class apply failed: {e}")
 
             if not self.__config_manager.to_work:
                 self.__gui.set_status("stopping…")
@@ -242,6 +286,11 @@ class PlatformQt:
                 float(self.__audio_settings["threshold"]),
                 int(self.__audio_settings["fs"]),
             )
+            self.__gui.sync_classes([k for k in cfg.names.keys() if k])
+            try:
+                self.__gui.sync_mic_level(float(self.__recorder.get_level()))
+            except Exception:
+                pass
 
             self.__gui.set_status(f"cam {self.__io.videodev}")
             self.__gui.render_frame(frame)
@@ -275,5 +324,6 @@ class PlatformQt:
 
 
 if __name__ == "__main__":
-    PlatformQt((1920, 1080), (58, 33)).run()
+    # 1280x720 is safer for consumer USB webcams on Windows.
+    PlatformQt((1280, 720), (58, 33)).run()
 

@@ -3,6 +3,8 @@ import vosk
 import threading
 import json
 import time
+import os
+import sys
 from ru_word2number import w2n
 import numpy as np
 
@@ -28,9 +30,25 @@ class AudioRecorder(ThreadManager, IAudioRecorder):
         self.__gain = 1.0
         self.__gate_threshold = 0.0
         self.__audio_lock = threading.Lock()
-
-        self.__model = vosk.Model(model_name)
+        self.__model_name = model_name
+        self.__model = None
+        self.__voice_enabled = True
+        try:
+            self.__model = vosk.Model(model_name)
+        except Exception as e:
+            self.__voice_enabled = False
+            if self.__logger:
+                model_hint = os.path.abspath(model_name)
+                self.__logger.warning(f"[Audio] Vosk model is unavailable: {e}")
+                self.__logger.warning(f"[Audio] Voice control disabled. Expected model dir: {model_hint}")
         self.__listen_thread = None
+        self.__input_channels = 1
+        self.__dtype = "int16"
+        self.__level = 0.0
+        if self.__device is None:
+            pref = self.__preferred_windows_input_device()
+            if pref is not None:
+                self.__device = pref
 
         if self.__logger:
             self.__logger.info(f"fs: {self.__fs}")
@@ -52,9 +70,96 @@ class AudioRecorder(ThreadManager, IAudioRecorder):
             return value
         return int(device)
 
+    def __preferred_windows_input_device(self) -> int | None:
+        if not sys.platform.startswith("win"):
+            return None
+        try:
+            hostapis = sd.query_hostapis()
+            name_to_idx = {str(h.get("name", "")).lower(): i for i, h in enumerate(hostapis)}
+            preferred_hosts = [
+                name_to_idx.get("windows directsound"),
+                name_to_idx.get("windows wdm-ks"),
+                name_to_idx.get("windows wasapi"),
+                name_to_idx.get("mme"),
+            ]
+            all_devs = sd.query_devices()
+            for hidx in preferred_hosts:
+                if hidx is None:
+                    continue
+                for idx, d in enumerate(all_devs):
+                    if int(d.get("max_input_channels", 0)) > 0 and int(d.get("hostapi", -1)) == int(hidx):
+                        return idx
+        except Exception:
+            return None
+        return None
+
+    def __device_candidates(self, requested: int | str | None) -> list[int | str]:
+        out: list[int | str] = []
+        if requested is not None:
+            out.append(requested)
+        try:
+            if self.__device is not None and self.__device not in out:
+                out.append(self.__device)
+        except Exception:
+            pass
+        try:
+            pref = self.__preferred_windows_input_device()
+            if pref is not None and pref not in out:
+                out.append(pref)
+        except Exception:
+            pass
+        try:
+            all_devs = sd.query_devices()
+            for idx, d in enumerate(all_devs):
+                if int(d.get("max_input_channels", 0)) > 0 and idx not in out:
+                    out.append(idx)
+        except Exception:
+            pass
+        return out
+
+    def __pick_working_stream_config(self, requested_dev: int | str | None) -> tuple[int | str | None, int, int, str] | None:
+        rates = [int(self.__fs), 48000, 44100, 16000, 8000]
+        dtypes = ["int16", "float32"]
+        def _probe_cb(indata, frames, t, status):
+            return
+        for dev in self.__device_candidates(requested_dev):
+            try:
+                info = sd.query_devices(dev)
+                max_ch = max(1, int(info.get("max_input_channels", 1) or 1))
+                default_sr = int(float(info.get("default_samplerate", 0)) or 0)
+            except Exception:
+                max_ch = 1
+                default_sr = 0
+            local_rates = rates.copy()
+            if default_sr and default_sr not in local_rates:
+                local_rates.insert(1, default_sr)
+            for r in local_rates:
+                for ch in [1, min(2, max_ch)]:
+                    for dt in dtypes:
+                        try:
+                            sd.check_input_settings(device=dev, channels=ch, samplerate=int(r), dtype=dt)
+                            stream = sd.InputStream(
+                                callback=_probe_cb,
+                                channels=ch,
+                                samplerate=int(r),
+                                dtype=dt,
+                                blocksize=0,
+                                device=dev,
+                            )
+                            stream.start()
+                            stream.stop()
+                            stream.close()
+                            return dev, int(r), int(ch), dt
+                        except Exception:
+                            continue
+        return None
+
     def __query_input_device_info(self, device: int | str | None):
         if device is not None:
             return sd.query_devices(device)
+        win_pref = self.__preferred_windows_input_device()
+        if win_pref is not None:
+            return sd.query_devices(win_pref)
         default_in = sd.default.device[0] if sd.default.device else None
         if default_in is not None and default_in >= 0:
             return sd.query_devices(default_in)
@@ -75,6 +180,10 @@ class AudioRecorder(ThreadManager, IAudioRecorder):
     def set_fs(self, fs: int):
         with self.__audio_lock:
             self.__fs = int(fs)
+
+    def get_level(self) -> float:
+        with self.__audio_lock:
+            return float(self.__level)
             
     def __words_to_num(self, text: str) -> int | float | None:
         try:
@@ -108,6 +217,14 @@ class AudioRecorder(ThreadManager, IAudioRecorder):
     def __listen_loop(self):
         rec = None
         handled = False
+        fail_count = 0
+
+        if not self.__voice_enabled or self.__model is None:
+            if self.__logger:
+                self.__logger.warning("[Audio] Listen loop idle: voice model not loaded")
+            while not self._stop_event.is_set():
+                time.sleep(0.25)
+            return
 
         TRIGGERS = self.__parser.get_triggers()
 
@@ -118,10 +235,22 @@ class AudioRecorder(ThreadManager, IAudioRecorder):
             if self._stop_event.is_set():
                 return
 
+            # Vosk expects mono stream; convert to mono if needed.
+            if getattr(indata, "ndim", 1) > 1 and indata.shape[1] > 1:
+                indata = indata[:, :1]
+
             # Apply mixer settings (gain + simple RMS gate)
             with self.__audio_lock:
                 gain = float(self.__gain)
                 thr = float(self.__gate_threshold)
+
+            try:
+                rms_now = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)) / 32768.0)
+                with self.__audio_lock:
+                    # Soft smoothing to avoid jitter in the meter.
+                    self.__level = 0.80 * float(self.__level) + 0.20 * min(1.0, rms_now * 8.0)
+            except Exception:
+                pass
 
             if thr > 0:
                 rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)) / 32768.0)
@@ -162,60 +291,55 @@ class AudioRecorder(ThreadManager, IAudioRecorder):
             with self.__audio_lock:
                 fs = int(self.__fs)
                 dev = self.__normalize_device(self.__device)
+                channels = int(self.__input_channels)
+                dtype = str(self.__dtype)
+
+            cfg = self.__pick_working_stream_config(dev)
+            if cfg is None:
+                fail_count += 1
+                if self.__logger and fail_count in (1, 5):
+                    self.__logger.warning("[Audio] no working microphone stream configuration found")
+                with self.__audio_lock:
+                    self.__level = 0.0
+                time.sleep(min(5.0, 0.4 * (2 ** min(fail_count, 4))))
+                continue
+
+            dev, fs, channels, dtype = cfg
+            with self.__audio_lock:
+                self.__device = dev
+                self.__fs = int(fs)
+                self.__input_channels = int(channels)
+                self.__dtype = str(dtype)
 
             try:
                 rec = vosk.KaldiRecognizer(self.__model, fs)
                 with sd.InputStream(
                     callback=callback,
-                    channels=1,
+                    channels=channels,
                     samplerate=fs,
-                    dtype="int16",
-                    blocksize=int(fs * 0.3),
+                    dtype=dtype,
+                    blocksize=0,
                     device=dev,
                 ):
                     self._stop_event.wait(timeout=0.25)
+                fail_count = 0
             except sd.PortAudioError as e:
                 msg = str(e)
                 if self.__logger:
                     self.__logger.warning(f"[Audio] PortAudioError: {msg}")
 
-                # Try fallback sample rates if device rejects the current one.
-                fallback = []
-                try:
-                    info = self.__query_input_device_info(dev)
-                    d_fs = int(float(info.get("default_samplerate", 0)) or 0)
-                    if d_fs:
-                        fallback.append(d_fs)
-                except Exception:
-                    pass
-
-                fallback += [16000, 44100, 48000, 8000]
-                tried = set()
-                switched = False
-                for f in fallback:
-                    if f in tried:
-                        continue
-                    tried.add(f)
-                    with self.__audio_lock:
-                        self.__fs = int(f)
-                    switched = True
-                    if self.__logger:
-                        self.__logger.warning(f"[Audio] retry with fs={f}")
-                    break
-
-                # Invalid/unavailable input device fallback.
-                if ("invalid device" in msg.lower() or "device unavailable" in msg.lower()):
-                    with self.__audio_lock:
-                        self.__device = None
-                    switched = True
-                    if self.__logger:
-                        self.__logger.warning("[Audio] fallback to default input device")
-
-                if not switched:
-                    time.sleep(0.5)
+                fail_count += 1
+                backoff = min(5.0, 0.2 * (2 ** min(fail_count, 5)))
+                if fail_count >= 8 and self.__logger:
+                    self.__logger.warning("[Audio] microphone unavailable for a while; keeping retries with backoff")
+                with self.__audio_lock:
+                    self.__level = 0.0
+                time.sleep(backoff)
             except Exception as e:
                 if self.__logger:
                     self.__logger.error(f"[Audio] listen loop error: {e}")
+                with self.__audio_lock:
+                    self.__level = 0.0
                 time.sleep(0.5)
 
         if self.__logger:

@@ -15,7 +15,7 @@ class IOOperatorHeadless(ThreadManager, IIOOperator):
 
     def __init__(
         self,
-        videodev: str,
+        videodev: str | int,
         fps: int,
         size: tuple[int, int],
         zoom: IZoomController,
@@ -54,10 +54,10 @@ class IOOperatorHeadless(ThreadManager, IIOOperator):
             return self.__latest_raw.copy() if self.__latest_raw is not None else None
 
     @property
-    def videodev(self) -> str:
+    def videodev(self) -> str | int:
         return self.__videodev
 
-    def set_videodev(self, videodev: str):
+    def set_videodev(self, videodev: str | int):
         """
         Switch v4l2 device. Safe to call while running:
         we restart ffmpeg and continue producing frames.
@@ -119,11 +119,46 @@ class IOOperatorHeadless(ThreadManager, IIOOperator):
         dev = self.__videodev
         if isinstance(dev, str) and dev.isdigit():
             dev = int(dev)
-        self.__cv_cap = cv2.VideoCapture(dev)
-        if not self.__cv_cap.isOpened():
-            self.__cv_cap.release()
+        if isinstance(dev, int):
+            backends = []
+            if hasattr(cv2, "CAP_DSHOW"):
+                backends.append(cv2.CAP_DSHOW)
+            if hasattr(cv2, "CAP_MSMF"):
+                backends.append(cv2.CAP_MSMF)
+            backends.append(cv2.CAP_ANY)
+            self.__cv_cap = None
+            for be in backends:
+                cap = None
+                try:
+                    cap = cv2.VideoCapture(dev, be)
+                    if cap.isOpened():
+                        ok, _ = cap.read()
+                        if ok:
+                            self.__cv_cap = cap
+                            break
+                except Exception as e:
+                    if self.__logger:
+                        self.__logger.warning(f"[IO] backend init failed ({be}): {e}")
+                finally:
+                    if cap is not None and self.__cv_cap is not cap:
+                        cap.release()
+        else:
+            try:
+                self.__cv_cap = cv2.VideoCapture(dev)
+            except Exception as e:
+                self.__cv_cap = None
+                if self.__logger:
+                    self.__logger.warning(f"[IO] camera open failed ({dev}): {e}")
+        if self.__cv_cap is None or not self.__cv_cap.isOpened():
+            if self.__cv_cap is not None:
+                self.__cv_cap.release()
             self.__cv_cap = None
             raise RuntimeError(f"Cannot open camera: {self.__videodev}")
+        # On Windows, forcing unsupported camera mode can produce corrupted frames.
+        try:
+            self.__cv_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        except Exception:
+            pass
         self.__cv_cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.__size[0]))
         self.__cv_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.__size[1]))
         self.__cv_cap.set(cv2.CAP_PROP_FPS, float(self.__fps))
@@ -169,19 +204,20 @@ class IOOperatorHeadless(ThreadManager, IIOOperator):
         self.__stop_proc()
 
     def start(self):
-        if self.__proc is None and self.__cv_cap is None:
-            try:
-                self.__start_proc()
-            except Exception as e:
-                if self.__logger:
-                    self.__logger.error(f"[IO] camera start failed: {e}")
-                return
-
         w, h = self.__size
         total_frames = 0
         record_start_time = time.time()
 
         while not self._stop_event.is_set():
+            if self.__proc is None and self.__cv_cap is None:
+                try:
+                    self.__start_proc()
+                except Exception as e:
+                    if self.__logger:
+                        self.__logger.error(f"[IO] camera start failed: {e}")
+                    time.sleep(0.7)
+                    continue
+
             cap = self.__cv_cap
             if cap is not None:
                 ok, frame = cap.read()
@@ -195,11 +231,21 @@ class IOOperatorHeadless(ThreadManager, IIOOperator):
                             self.__logger.error(f"[IO] camera restart failed: {e}")
                         time.sleep(0.2)
                     continue
+                # Normalize camera output to BGR for downstream pipeline.
+                try:
+                    if frame.ndim == 2:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                    elif frame.ndim == 3 and frame.shape[2] == 4:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                    elif frame.ndim == 3 and frame.shape[2] == 1:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                except Exception:
+                    pass
                 if frame.shape[:2] != (h, w):
                     frame = np.ascontiguousarray(frame)
                     try:
-                        import cv2
-                        frame = cv2.resize(frame, (w, h))
+                        # Keep camera native aspect and only scale for model input.
+                        frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA if frame.shape[1] > w else cv2.INTER_LINEAR)
                     except Exception:
                         pass
             else:
